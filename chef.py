@@ -1,22 +1,22 @@
-from asyncio.events import get_running_loop
-import re
+import asyncio
+import atexit
+import multiprocessing as mp
 import os
-import sys
-from pathlib import Path
+import re
 import subprocess
+import sys
+from asyncio.events import get_running_loop
+from datetime import datetime, timedelta
+from pathlib import Path
+from queue import Queue
+from signal import SIGINT, SIGKILL, SIGTERM, SIGUSR1, signal
+from threading import Timer
+
+import inotify_simple
+from aiohttp import web
 from rich import print
 from rich.console import Console
 from rich.traceback import install
-from datetime import datetime, timedelta
-from aiohttp import web
-from queue import Queue
-import asyncio
-import inotify_simple
-import multiprocessing as mp
-from threading import Timer
-from signal import SIGINT, SIGTERM, SIGUSR1, signal, SIGKILL
-import atexit
-
 
 console = Console()
 install(console=console)
@@ -24,22 +24,22 @@ here = Path(__file__).parent
 
 requests = Queue()
 
-logo = '''
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⣠⣴⠖⠛⠉⠙⠓⠒⠦⢤⣀⡀⠀⠀⣀⣤⡶⠖⠛⠛⠳⡄⠀⠀⠀⠀⠀⠀⣠⡶⠟⡆⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢀⣴⡾⢻⠄
-⠀⠀⠀⠀⢾⠟⠁⠀⠀⠀⠀⠀⠀⠀⠀⠈⢙⣷⣾⣿⣥⣀⣀⣀⣤⠞⠁⠀⠀⠀⠀⢠⣾⢟⣠⠜⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣋⡠⠎⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⣿⠟⠀⠀⠀⠉⠉⣴⣶⠿⠛⠉⠉⠉⣹⣿⠋⠉⠀⠀⠀⢀⣴⣾⠟⠛⠉⠉⢉⣿⣿⣉⠁⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⡿⠃⠀⠀⠀⠀⠀⠀⠉⠁⠀⠀⠀⠀⣼⣿⠃⢀⣤⣤⠀⠀⢀⣩⣤⣤⠀⢠⢚⣿⡿⠉⠉⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣼⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣰⣿⣣⠞⣹⣿⠏⠀⣰⣿⠟⠁⢨⠇⠈⣼⡿⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣸⣿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⢠⣿⡷⠁⢰⣿⠏⢀⣼⣿⠃⣀⠴⠋⢀⣾⡿⠁⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⡴⠻⣿⠀⠀⢸⣏⡠⠊⢻⣯⠉⢀⣀⠔⢫⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣿⡇⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠞⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠉⠉⠉⠀⢠⡿⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠹⣷⡀⠀⠀⠀⠀⠀⠀⣀⡤⠚⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣠⠟⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠈⠙⠓⠶⠶⠶⠒⠋⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⣀⣀⣀⣤⠞⠁⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠛⠛⠋⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀⠀
-'''
+logo = """
+                                                    
+                                                    
+     ⣠⣴⠖⠛⠉⠙⠓⠒⠦⢤⣀⡀  ⣀⣤⡶⠖⠛⠛⠳⡄      ⣠⡶⠟⡆          ⢀⣴⡾⢻⠄
+    ⢾⠟⠁        ⠈⢙⣷⣾⣿⣥⣀⣀⣀⣤⠞⠁    ⢠⣾⢟⣠⠜⠁         ⣰⣿⣋⡠⠎ 
+               ⣠⣿⠟   ⠉⠉⣴⣶⠿⠛⠉⠉⠉⣹⣿⠋⠉   ⢀⣴⣾⠟⠛⠉⠉⢉⣿⣿⣉⠁   
+              ⣼⡿⠃      ⠉⠁    ⣼⣿⠃⢀⣤⣤  ⢀⣩⣤⣤ ⢠⢚⣿⡿⠉⠉    
+             ⣼⡿⠁            ⣰⣿⣣⠞⣹⣿⠏ ⣰⣿⠟⠁⢨⠇⠈⣼⡿       
+            ⣸⣿⠁            ⢠⣿⡷⠁⢰⣿⠏⢀⣼⣿⠃⣀⠴⠋⢀⣾⡿⠁       
+            ⣿⡇            ⡴⠻⣿  ⢸⣏⡠⠊⢻⣯⠉⢀⣀⠔⢫⡿⠁        
+            ⣿⡇          ⣠⠞          ⠉⠉⠉ ⢠⡿⠁         
+            ⠹⣷⡀      ⣀⡤⠚⠁              ⣠⠟           
+             ⠈⠙⠓⠶⠶⠶⠒⠋⠁            ⣀⣀⣀⣤⠞⠁            
+                                  ⠛⠛⠋               
+                                                    
+"""
 
 cpp20_flags = ["g++", "-std=c++20", "-Wshadow", "-Wall"]
 
@@ -70,6 +70,13 @@ def run_cpp(file_path, inputs):
 
     subprocess.run(out_path)
 
+
+def run_py(file_path):
+    os.setpgrp()
+    print(f"-> Running {file_path.name}: ")
+    subprocess.run(["python3", file_path], cwd=file_path.parent)
+
+
 def prepareCpp(problemInfo, templateContent):
     preamble = "/*\n"
     preamble += f" * {problemInfo['name']}\n"
@@ -82,6 +89,7 @@ def prepareCpp(problemInfo, templateContent):
 
     return f"{preamble}\n{templateContent}\n{tests}\n"
 
+
 selected_lang = "cpp20"
 langOptions = {
     "cpp20": {
@@ -93,12 +101,14 @@ langOptions = {
             "codechef.com": "templates/codechef.cpp",
             "codingcompetitions.withgoogle.com": "templates/google.cpp",
         },
-        "prepareTemplate": prepareCpp
+        "prepareTemplate": prepareCpp,
     }
 }
 
+
 async def createProblemFile(problemInfo):
     lang = langOptions[selected_lang]
+
     def getTemplate():
         for substr, templFileName in lang.get("special_templates", {}).items():
             if substr in problemInfo["url"]:
@@ -106,9 +116,9 @@ async def createProblemFile(problemInfo):
 
         if "template" in lang:
             return Path(lang["template"]).read_text()
-        
+
         return ""
-    
+
     problemFilePath = here / f"{problemInfo['name']}{lang['suffix']}"
 
     if problemFilePath.exists():
@@ -121,11 +131,10 @@ async def createProblemFile(problemInfo):
 
     if "prepareTemplate" in lang:
         fileContent = prepareCpp(problemInfo, fileContent)
-    
+
     problemFilePath.write_text(fileContent)
 
     return problemFilePath
-
 
 
 async def openFileInEditor(filePath):
@@ -141,14 +150,17 @@ async def handleRequest(request):
 
     problemFilePath = await createProblemFile(problemInfo)
     await openFileInEditor(problemFilePath)
-    
+
     return web.Response(text="Thanks :)")
+
 
 app = web.Application()
 app.add_routes([web.post("/", handleRequest)])
 
+
 class TimedSet:
     """A set that automatically removes elements after a specified TTL"""
+
     def __init__(self, ttl):
         self.set = set()
         self.ttl = ttl
@@ -159,6 +171,7 @@ class TimedSet:
         self.set.add(item)
         Timer(1, self.set.remove, args=[item]).start()
         return False
+
 
 def getCommentedInput(filePath):
     with open(filePath) as f:
@@ -175,10 +188,16 @@ def getCommentedInput(filePath):
 
 def watcher():
     inotify = inotify_simple.INotify()
-    watch_descriptor = inotify.add_watch(here, inotify_simple.flags.CLOSE_WRITE)
+
+    watch_paths = [here, *[p for p in here.glob("AoC*") if p.is_dir()]]
+
+    watch_descriptors = {
+        inotify.add_watch(watch_path, inotify_simple.flags.CLOSE_WRITE): watch_path
+        for watch_path in watch_paths
+    }
 
     changed_events = TimedSet(1)
-    current_subproc= mp.Process()
+    current_subproc = mp.Process()
 
     def kill_children(*args):
         if current_subproc.is_alive():
@@ -189,7 +208,8 @@ def watcher():
     def cleanup(*args):
         kill_children()
         console.log("Closing watch descriptor")
-        inotify.rm_watch(watch_descriptor)
+        for watch_desc in watch_descriptors.keys():
+            inotify.rm_watch(watch_desc)
         inotify.close()
         sys.exit()
 
@@ -200,16 +220,18 @@ def watcher():
         for event in inotify.read():
             if event.name in changed_events:
                 continue
-            
-            # print(event.name)
+
             console.log(event)
 
-            file_path = Path(event.name)
-            
+            file_path = watch_descriptors[event.wd] / event.name
+
             kill_children()
             if file_path.suffix == ".cpp":
                 inputs = getCommentedInput(file_path)
                 current_subproc = mp.Process(target=run_cpp, args=(file_path, inputs), daemon=True)
+                current_subproc.start()
+            elif file_path.suffix == ".py":
+                current_subproc = mp.Process(target=run_py, args=(file_path,), daemon=True)
                 current_subproc.start()
             elif file_path.name == Path(__file__).name:
                 # Send SIGUSR1 to parent process requesting a restart
@@ -244,21 +266,27 @@ async def precompile_headers():
     if not (headerPath := get_header()):
         print("Could not find bits/stdc++.h")
         return
-    
+
     dest_header.write_text(headerPath.read_text())
 
     print("-> Precompiling headers: ", end="", flush=True)
     start_time = datetime.now()
     compiling_proc = subprocess.run([*cpp20_flags, "stdc++.h"], cwd=dest_dir)
     time_elapsed = datetime.now() - start_time
-    print("[bold green]OK[/bold green]" if compiling_proc.returncode == 0 else "[bold red]ERROR[bold red]", f"[grey70]{time_elapsed.microseconds / 1e5:.2f}s[/grey70]")
+    print(
+        "[bold green]OK[/bold green]"
+        if compiling_proc.returncode == 0
+        else "[bold red]ERROR[bold red]",
+        f"[grey70]{time_elapsed.microseconds / 1e5:.2f}s[/grey70]",
+    )
+
 
 async def main():
     print(logo)
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, 'localhost', 10043)
+    site = web.TCPSite(runner, "localhost", 10043)
     await site.start()
 
     watch_proc = mp.Process(target=watcher)
