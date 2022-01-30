@@ -41,7 +41,14 @@ logo = """
                                                     
 """
 
-cpp20_flags = ["g++", "-std=c++20", "-Wshadow", "-Wall"]
+cpp20_flags = [
+    "g++",
+    "-std=c++20",
+    "-Wshadow",
+    "-Wall",
+    "-fsanitize=address",
+    "-fno-omit-frame-pointer",
+]
 
 
 def run_cpp(file_path, inputs):
