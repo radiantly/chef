@@ -13,7 +13,7 @@ from signal import SIGINT, SIGKILL, SIGTERM, SIGUSR1, signal
 from threading import Timer
 
 import inotify_simple
-from aiohttp import web
+from aiohttp import ClientSession, web
 from rich import print
 from rich.console import Console
 from rich.traceback import install
@@ -102,10 +102,8 @@ langOptions = {
     "cpp20": {
         "runner": run_cpp,
         "suffix": ".cpp",
-        "template": "templates/codeforces.cpp",
+        "template": "templates/default.cpp",
         "special_templates": {
-            "codeforces.com": "templates/codeforces.cpp",
-            "codechef.com": "templates/codechef.cpp",
             "codingcompetitions.withgoogle.com": "templates/google.cpp",
         },
         "prepareTemplate": prepareCpp,
@@ -145,7 +143,7 @@ async def createProblemFile(problemInfo):
 
 
 async def openFileInEditor(filePath):
-    subprocess.run(["code", "-a", here.as_posix(), filePath.as_posix()])
+    subprocess.run(["code", here.as_posix(), filePath.as_posix()])
 
 
 async def handleRequest(request):
@@ -161,8 +159,18 @@ async def handleRequest(request):
     return web.Response(text="Thanks :)")
 
 
+async def sendSigTermToSelf():
+    os.kill(os.getpid(), SIGTERM)
+
+
+async def handleKillRequest(request):
+    console.log("Received Exit request")
+    asyncio.create_task(sendSigTermToSelf())
+    return web.Response(text="Request received.")
+
+
 app = web.Application()
-app.add_routes([web.post("/", handleRequest)])
+app.add_routes([web.post("/", handleRequest), web.get("/exit", handleKillRequest)])
 
 
 class TimedSet:
@@ -176,7 +184,7 @@ class TimedSet:
         if item in self.set:
             return True
         self.set.add(item)
-        Timer(1, self.set.remove, args=[item]).start()
+        Timer(self.ttl, self.set.remove, args=[item]).start()
         return False
 
 
@@ -210,6 +218,8 @@ def watcher():
         if current_subproc.is_alive():
             os.killpg(current_subproc.pid, SIGKILL)
             print("[red]\n-> Terminating current process [/red]")
+            return True
+        return False
 
     @atexit.register
     def cleanup(*args):
@@ -220,7 +230,11 @@ def watcher():
         inotify.close()
         sys.exit()
 
-    signal(SIGINT, kill_children)
+    def handle_sigint(*args):
+        if not kill_children():
+            os.kill(os.getppid(), SIGTERM)
+
+    signal(SIGINT, handle_sigint)
     signal(SIGTERM, cleanup)
 
     while True:
@@ -233,16 +247,16 @@ def watcher():
             file_path = watch_descriptors[event.wd] / event.name
 
             kill_children()
-            if file_path.suffix == ".cpp":
+            if file_path.name == Path(__file__).name:
+                # Send SIGUSR1 to parent process requesting a restart
+                os.kill(os.getppid(), SIGUSR1)
+            elif file_path.suffix == ".cpp":
                 inputs = getCommentedInput(file_path)
                 current_subproc = mp.Process(target=run_cpp, args=(file_path, inputs), daemon=True)
                 current_subproc.start()
             elif file_path.suffix == ".py":
                 current_subproc = mp.Process(target=run_py, args=(file_path,), daemon=True)
                 current_subproc.start()
-            elif file_path.name == Path(__file__).name:
-                # Send SIGUSR1 to parent process requesting a restart
-                os.kill(os.getppid(), SIGUSR1)
 
 
 async def precompile_headers():
@@ -288,12 +302,22 @@ async def precompile_headers():
     )
 
 
+async def killExistingInstance():
+    try:
+        async with ClientSession() as session:
+            async with session.get("http://localhost:10043/exit"):
+                print("-> Sent Exit request to currently running instance")
+    except:
+        pass
+
+
 async def main():
     print(logo)
+    await killExistingInstance()
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "localhost", 10043)
+    site = web.TCPSite(runner, "localhost", 10043, reuse_address=True, reuse_port=True)
     await site.start()
 
     watch_proc = mp.Process(target=watcher)
@@ -310,12 +334,13 @@ async def main():
         console.log("Restarting Chef")
         os.execl(sys.executable, sys.executable, __file__)
 
-    loop = get_running_loop()
-    loop.add_signal_handler(SIGINT, prepareExit)
-    loop.add_signal_handler(SIGUSR1, restart)
-
     asyncio.create_task(precompile_headers())
     watch_proc.start()
+
+    loop = get_running_loop()
+    loop.add_signal_handler(SIGINT, lambda *args: None)
+    loop.add_signal_handler(SIGTERM, prepareExit)
+    loop.add_signal_handler(SIGUSR1, restart)
 
     await kill_sig.wait()
 
