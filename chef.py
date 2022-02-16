@@ -6,17 +6,19 @@ import re
 import subprocess
 import sys
 from asyncio.events import get_running_loop
-from datetime import datetime, timedelta
 from pathlib import Path
 from queue import Queue
 from signal import SIGINT, SIGKILL, SIGTERM, SIGUSR1, signal
 from threading import Timer
+from time import perf_counter
 
 import inotify_simple
 from aiohttp import ClientSession, web
 from rich import print
 from rich.console import Console
 from rich.traceback import install
+
+PORT = 10043
 
 console = Console()
 install(console=console)
@@ -46,8 +48,10 @@ cpp20_flags = [
     "-std=c++20",
     "-Wshadow",
     "-Wall",
+    "-Wfloat-equal",
     "-fsanitize=address",
     "-fno-omit-frame-pointer",
+    "-pedantic",
 ]
 
 
@@ -58,10 +62,10 @@ def run_cpp(file_path, inputs):
     out_path = out_dir / file_path.stem
 
     print(f"-> Compiling {file_path.name}: ", end="", flush=True)
-    compile_start = datetime.now()
+    compile_start = perf_counter()
     compile_proc = subprocess.run([*cpp20_flags, file_path, "-o", out_path])
-    compile_time = datetime.now() - compile_start
-    compile_time_out = f"[grey70]{compile_time.microseconds // 1000}ms[/grey70]"
+    compile_time = perf_counter() - compile_start
+    compile_time_out = f"[grey70]{compile_time * 1000:.0f}ms[/grey70]"
     if compile_proc.returncode == 0:
         print(f"[bold green]OK[/bold green]", compile_time_out)
     else:
@@ -237,6 +241,8 @@ def watcher():
     signal(SIGINT, handle_sigint)
     signal(SIGTERM, cleanup)
 
+    print("-> Started watching directory for changes")
+
     while True:
         for event in inotify.read():
             if event.name in changed_events:
@@ -276,37 +282,28 @@ async def precompile_headers():
     dest_dir.mkdir(exist_ok=True)
     dest_header = dest_dir / "stdc++.h"
 
-    precomp_header = dest_dir / (dest_header.name + ".gch")
-
-    if precomp_header.exists():
-        last_modified = datetime.fromtimestamp(precomp_header.stat().st_mtime)
-        if last_modified + timedelta(hours=3) > datetime.now():
-            print("[green]-> Headers were recently precompiled. Skipping..[/green]")
-            return
-
     if not (headerPath := get_header()):
         print("Could not find bits/stdc++.h")
         return
 
     dest_header.write_text(headerPath.read_text())
 
-    print("-> Precompiling headers: ", end="", flush=True)
-    start_time = datetime.now()
-    compiling_proc = subprocess.run([*cpp20_flags, "stdc++.h"], cwd=dest_dir)
-    time_elapsed = datetime.now() - start_time
+    start_time = perf_counter()
+    compiling_proc = await asyncio.create_subprocess_exec(*cpp20_flags, "stdc++.h", cwd=dest_dir)
     print(
+        "-> Precompiling headers:",
         "[bold green]OK[/bold green]"
-        if compiling_proc.returncode == 0
+        if await compiling_proc.wait() == 0
         else "[bold red]ERROR[bold red]",
-        f"[grey70]{time_elapsed.microseconds / 1e5:.2f}s[/grey70]",
+        f"[grey70]{perf_counter() - start_time:.2f}s[/grey70]",
     )
 
 
 async def killExistingInstance():
     try:
         async with ClientSession() as session:
-            async with session.get("http://localhost:10043/exit"):
-                print("-> Sent Exit request to currently running instance")
+            async with session.get(f"http://localhost:{PORT}/exit"):
+                print("-> Another instance was detected: Exit requested")
     except:
         pass
 
@@ -317,8 +314,9 @@ async def main():
 
     runner = web.AppRunner(app)
     await runner.setup()
-    site = web.TCPSite(runner, "localhost", 10043, reuse_address=True, reuse_port=True)
-    await site.start()
+    site = web.TCPSite(runner, "localhost", PORT, reuse_address=True, reuse_port=True)
+    asyncio.create_task(site.start())
+    print(f"-> Listening on port {PORT}")
 
     watch_proc = mp.Process(target=watcher)
 
