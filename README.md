@@ -9,6 +9,8 @@ A python script that takes care of all the knick-knacks in competitive programmi
 
 </div>
 
+![Demo](.github/demo.gif)
+
 ### Features
 
 - **Header precompilation:** In competitive programming, it is a common practice to include `bits/stdc++.h` which in turn includes all other headers. Precompiling this header shortens the compile time.
@@ -48,4 +50,4 @@ python chef.py
 
 MIT
 
-_Chef hat illustration by [Icons 8](https://icons8.com/illustrations/author/5c07e68d82bcbc0092519bb6) from [Ouch!](https://icons8.com/illustrations)_
+_Chef hat illustration by [Icons 8](https://icons8.com/illustrations/) from [Ouch!](https://icons8.com/illustrations/author/5c07e68d82bcbc0092519bb6)_

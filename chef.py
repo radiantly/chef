@@ -55,7 +55,7 @@ cpp20_flags = [
 ]
 
 
-def run_cpp(file_path, inputs):
+def run_cpp(file_path: Path, inputs):
     os.setpgrp()
     out_dir = here / "out"
     out_dir.mkdir(exist_ok=True)
@@ -73,16 +73,15 @@ def run_cpp(file_path, inputs):
         return
 
     if inputs:
-        console.print("[yellow]-> Inputs:[/yellow]", inputs)
         for inp in inputs:
+            console.print("[yellow]-> Input:[/yellow]", inp)
             if subprocess.run(out_path, input=inp[0].encode()).returncode:
                 break
-        return
+    else:
+        subprocess.run(out_path)
 
-    subprocess.run(out_path)
 
-
-def run_py(file_path):
+def run_py(file_path: Path):
     os.setpgrp()
     print(f"-> Running {file_path.name}: ")
     subprocess.run(["python3", file_path], cwd=file_path.parent)
