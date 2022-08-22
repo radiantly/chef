@@ -1,14 +1,14 @@
 import asyncio
-import atexit
 import multiprocessing as mp
 import os
 import re
 import subprocess
 import sys
 from asyncio.events import get_running_loop
+from ctypes import cdll
 from pathlib import Path
 from queue import Queue
-from signal import SIGINT, SIGKILL, SIGTERM, SIGUSR1, signal
+from signal import SIG_IGN, SIGINT, SIGKILL, SIGTERM, SIGTTOU, SIGUSR1, signal
 from threading import Timer
 from time import perf_counter
 
@@ -43,27 +43,57 @@ logo = """
                                                     
 """
 
+c_flags = ["gcc", "-Wall", "-Wextra", "-Werror", "-g"]
+
 cpp20_flags = [
     "g++",
     "-std=c++20",
     "-Wshadow",
     "-Wall",
     "-Wfloat-equal",
-    "-fsanitize=address",
+    "-fsanitize=address,undefined",
     "-fno-omit-frame-pointer",
     "-pedantic",
 ]
 
 
-def run_cpp(file_path: Path, inputs):
-    os.setpgrp()
+libc = cdll.LoadLibrary("libc.so.6")
+
+
+def safe_subprocess_run(*args, **kwargs):
+    """
+    subprocess.run but the child process is
+    > set to a new process group and set as foreground process group
+    > the child process is killed if parent dies
+    """
+
+    # So, every controlling terminal has 1 foreground process group, and
+    # only processes in that group can read stdin. Our strategy is to
+    # set a new process group for the child process, and then set that
+    # group as the foreground group for the controlling terminal. Once the
+    # child process has finished execution we reset it to the current group
+    def preexec_fn():
+        os.setpgrp()
+
+        os.tcsetpgrp(1, os.getpgrp())
+
+        PR_SET_PDEATHSIG = 1
+        libc.prctl(PR_SET_PDEATHSIG, SIGKILL)
+
+    proc = subprocess.run(*args, **kwargs, restore_signals=False, preexec_fn=preexec_fn)
+    os.tcsetpgrp(1, os.getpgrp())
+
+    return proc
+
+
+def run_clike(file_path: Path, inputs: list[str] | None, compiler_flags: list):
     out_dir = here / "out"
     out_dir.mkdir(exist_ok=True)
     out_path = out_dir / file_path.stem
 
     print(f"-> Compiling {file_path.name}: ", end="", flush=True)
     compile_start = perf_counter()
-    compile_proc = subprocess.run([*cpp20_flags, file_path, "-o", out_path])
+    compile_proc = safe_subprocess_run([*compiler_flags, file_path, "-o", out_path])
     compile_time = perf_counter() - compile_start
     compile_time_out = f"[grey70]{compile_time * 1000:.0f}ms[/grey70]"
     if compile_proc.returncode == 0:
@@ -74,17 +104,55 @@ def run_cpp(file_path: Path, inputs):
 
     if inputs:
         for inp in inputs:
-            console.print("[yellow]-> Input:[/yellow]", inp)
-            if subprocess.run(out_path, input=inp[0].encode()).returncode:
+            console.print("[yellow]-> Input:[/yellow]", inp[0].encode())
+            if safe_subprocess_run(out_path, input=inp[0].encode()).returncode:
                 break
     else:
-        subprocess.run(out_path)
+        safe_subprocess_run(out_path)
 
 
 def run_py(file_path: Path):
-    os.setpgrp()
     print(f"-> Running {file_path.name}: ")
-    subprocess.run(["python3", file_path], cwd=file_path.parent)
+
+    safe_subprocess_run(["python3", file_path], cwd=file_path.parent)
+
+
+def run_java(file_path: Path, inputs: list[str] | None):
+    out_dir = here / "out"
+    out_dir.mkdir(exist_ok=True)
+
+    print(f"-> Compiling {file_path.name}: ", end="", flush=True)
+    compile_start = perf_counter()
+    compile_proc = safe_subprocess_run(["javac", file_path, "-d", out_dir])
+    compile_time = perf_counter() - compile_start
+    compile_time_out = f"[grey70]{compile_time * 1000:.0f}ms[/grey70]"
+    if compile_proc.returncode == 0:
+        print(f"[bold green]OK[/bold green]", compile_time_out)
+    else:
+        print(f"[bold red]ERROR[/bold red]", compile_time_out)
+        return
+
+    # TODO: Get class that contains main function
+    classNames = re.findall(r"class\s+([^ {]+)", file_path.read_text())
+    if not classNames:
+        print("[bold red]-> ERROR: Could not find class name[/bold red]")
+        return
+
+    className = classNames[0]
+
+    if inputs:
+        for inp in inputs:
+            console.print("[yellow]-> Input:[/yellow]", inp)
+            if safe_subprocess_run(
+                ["java", className],
+                input=inp[0].encode(),
+                cwd=out_dir,
+            ).returncode:
+                break
+    else:
+        pass
+        # TODO: Input handlind
+        # subprocess.run(["java", className], cwd=out_dir)
 
 
 def prepareCpp(problemInfo, templateContent):
@@ -103,7 +171,6 @@ def prepareCpp(problemInfo, templateContent):
 selected_lang = "cpp20"
 langOptions = {
     "cpp20": {
-        "runner": run_cpp,
         "suffix": ".cpp",
         "template": "templates/default.cpp",
         "special_templates": {
@@ -217,15 +284,14 @@ def watcher():
     changed_events = TimedSet(1)
     current_subproc = mp.Process()
 
-    def kill_children(*args):
+    def kill_children(*_):
         if current_subproc.is_alive():
-            os.killpg(current_subproc.pid, SIGKILL)
-            print("[red]\n-> Terminating current process [/red]")
+            os.kill(current_subproc.pid, SIGKILL)
+            console.log("[red]Terminating current process[/red]")
             return True
         return False
 
-    @atexit.register
-    def cleanup(*args):
+    def cleanup(*_):
         kill_children()
         console.log("Closing watch descriptor")
         for watch_desc in watch_descriptors.keys():
@@ -233,12 +299,7 @@ def watcher():
         inotify.close()
         sys.exit()
 
-    def handle_sigint(*args):
-        if not kill_children():
-            os.kill(os.getppid(), SIGTERM)
-
-    signal(SIGINT, handle_sigint)
-    signal(SIGTERM, cleanup)
+    signal(SIGINT, cleanup)
 
     print("-> Started watching directory for changes")
 
@@ -251,16 +312,31 @@ def watcher():
 
             file_path = watch_descriptors[event.wd] / event.name
 
+            # Skip if empty file
+            if file_path.stat().st_size == 0:
+                continue
+
             kill_children()
             if file_path.name == Path(__file__).name:
                 # Send SIGUSR1 to parent process requesting a restart
                 os.kill(os.getppid(), SIGUSR1)
+                cleanup()
+            elif file_path.suffix == ".c":
+                inputs = getCommentedInput(file_path)
+                current_subproc = mp.Process(target=run_clike, args=(file_path, inputs, c_flags))
+                current_subproc.start()
             elif file_path.suffix == ".cpp":
                 inputs = getCommentedInput(file_path)
-                current_subproc = mp.Process(target=run_cpp, args=(file_path, inputs), daemon=True)
+                current_subproc = mp.Process(
+                    target=run_clike, args=(file_path, inputs, cpp20_flags)
+                )
+                current_subproc.start()
+            elif file_path.suffix == ".java":
+                inputs = getCommentedInput(file_path)
+                current_subproc = mp.Process(target=run_java, args=(file_path, inputs))
                 current_subproc.start()
             elif file_path.suffix == ".py":
-                current_subproc = mp.Process(target=run_py, args=(file_path,), daemon=True)
+                current_subproc = mp.Process(target=run_py, args=(file_path,))
                 current_subproc.start()
 
 
@@ -321,13 +397,8 @@ async def main():
 
     kill_sig = asyncio.Event()
 
-    def prepareExit():
-        watch_proc.terminate()
-        watch_proc.join()
-        kill_sig.set()
-
     def restart():
-        prepareExit()
+        kill_sig.set()
         console.log("Restarting Chef")
         os.execl(sys.executable, sys.executable, __file__)
 
@@ -335,12 +406,15 @@ async def main():
     watch_proc.start()
 
     loop = get_running_loop()
-    loop.add_signal_handler(SIGINT, lambda *args: None)
-    loop.add_signal_handler(SIGTERM, prepareExit)
+    loop.add_signal_handler(SIGINT, kill_sig.set)
     loop.add_signal_handler(SIGUSR1, restart)
 
     await kill_sig.wait()
 
 
 if __name__ == "__main__":
+    # Whenever a process from a background process group calls os.tcsetpgrp(),
+    # a SIGTTOU signal is sent to all the process in that group.
+    signal(SIGTTOU, SIG_IGN)
+
     asyncio.run(main())
